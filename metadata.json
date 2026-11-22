@@ -1,0 +1,7 @@
+{
+  "data_mode": "synthetic_demo",
+  "n_rows": 74201,
+  "n_patients": 7467,
+  "n_slopes": 5600,
+  "min_group_size": 30
+}
