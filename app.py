@@ -1,203 +1,403 @@
-"""Public-safe, aggregated nephrology EDA dashboard.
+"""Interactive nephrology EDA sourced from the approved project CSV on GitHub.
 
-No private patient rows are fetched or served. The trajectory explorer is synthetic.
-All real analysis tables must be reviewed and approved before public deployment.
+The analytical definitions mirror INSY_6500_Project_Gladish(2) notebook:
+- daily-median eGFR; >=3 distinct days over >=1 year for slope
+- patient-level medians require >=2 distinct days
+- earliest complete eight-variable KFRE record, age>=18 and 15<=eGFR<60
+- 3-month windows with >=2 distinct dates and window mean below 15/10
+Use for educational exploration, NOT clinical decisions or formal KFRE validation.
 """
-from pathlib import Path
-import json
+import os
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-
-ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
-GFR_ORDER = ["G1", "G2", "G3a", "G3b", "G4", "G5"]
-FEATURE_LABELS = {
-    "acr": "Median ACR (mg/g)", "calcium": "Median calcium (mg/dL)",
-    "potassium": "Median potassium (mmol/L)", "hemoglobin": "Median hemoglobin (g/dL)",
-    "phosphorus": "Median phosphorus (mg/dL)", "glucose": "Median glucose (mg/dL)",
-    "co2": "Median CO₂ (mmol/L)", "albumin": "Median serum albumin (g/dL)",
-    "creatinine": "Median creatinine (mg/dL)",
-    "systolic_bp": "Median systolic BP (mmHg)", "diastolic_bp": "Median diastolic BP (mmHg)",
-    "bmi": "Median BMI (kg/m²)", "MAP": "Median MAP (mmHg)",
-}
+from scipy.stats import binomtest
 
 st.set_page_config(page_title="Nephrology EDA", page_icon="🩺", layout="wide")
 
-@st.cache_data(show_spinner=False)
-def load_public_data():
-    names = ["overview", "distributions", "associations", "regressions", "kfre"]
-    tables = {}
-    for name in names:
-        filename = DATA / f"{name}.csv"
-        if not filename.exists():
-            st.error(f"Missing {filename.name}. See README for the data preparation step.")
-            st.stop()
-        tables[name] = pd.read_csv(filename)
-    with (DATA / "metadata.json").open(encoding="utf-8") as f:
-        meta = json.load(f)
-    return meta, tables
+# This exact source URL appears in cell 5 of the supplied EDA notebook.
+DEFAULT_DATA_URL = (
+    "https://github.com/ggladish1/INSY_6500_EDA/raw/refs/heads/main/EDA%20Data%203"
+)
+# Secrets may not be configured for a new Community Cloud app.
+try:
+    configured_url = st.secrets.get("DATA_URL", None)
+except Exception:
+    configured_url = None
+DATA_URL = configured_url or os.environ.get("NEPHROLOGY_DATA_URL", DEFAULT_DATA_URL)
+GFR_ORDER = ["G1", "G2", "G3a", "G3b", "G4", "G5"]
+LABS = ["calcium", "potassium", "hemoglobin", "phosphorus", "glucose", "co2", "albumin", "creatinine"]
+VITALS = ["systolic_bp", "diastolic_bp", "bmi", "MAP"]
+FEATURES = ["acr", *LABS, *VITALS]
+BAD_VALUE_LIMITS = {
+    "egfr": (0, 150), "acr": (0, None), "creatinine": (0, 20),
+    "glucose": (0, 600), "calcium": (0, 15), "potassium": (0, 8),
+    "hemoglobin": (0, 18), "phosphorus": (0, 15), "co2": (0, 45)
+}
+REQUIRED = ["study_id", "lab_date", "date_of_birth", "sex", "egfr", "acr", "albumin", "phosphorus", "co2", "calcium"]
 
-meta, data = load_public_data()
-if meta.get("data_mode") not in ("synthetic_demo", "approved_aggregates"):
-    st.error("Unrecognized data publication mode. Refusing to display.")
+
+def clean_category(series):
+    s = series.astype("string").str.strip()
+    return s.mask(s.str.lower().isin(["", "nan", "none", "null", "n/a", "<na>"]))
+
+
+def normalize_location(series):
+    s = clean_category(series)
+    names = {
+        "cullman": "Cullman", "nephrology of north alabama cullman": "Cullman",
+        "c-nephrology of north alabama": "Cullman", "cullman-nephrology of north alabama": "Cullman",
+        "cullman nephrology of north alabama pc": "Cullman", "cullman nephrology of north alabama": "Cullman",
+        "decatur": "Decatur", "decatur nephrology of north alabama pc": "Decatur",
+        "decatur nephrology of north alabama": "Decatur",
+        "nephrology of north alabama decatur": "Decatur", "nephrology of north alabama": "Unspecified",
+        "decatur morgan hospital ip": "Decatur Morgan Hospital IP"
+    }
+    return s.str.lower().map(names).fillna(s)
+
+
+@st.cache_data(show_spinner="Downloading and cleaning approved source data…", ttl=3600)
+def load_source(url):
+    # Read remote CSV regardless of whether its filename ends in .csv.
+    df = pd.read_csv(url, dtype={"study_id": "string"}).drop_duplicates().copy()
+    missing = sorted(set(REQUIRED) - set(df.columns))
+    if missing:
+        raise ValueError(f"Missing notebook-required columns: {missing}")
+    for col in ["lab_date", "encounter_date", "date_of_birth"]:
+        if col not in df:
+            df[col] = pd.NaT
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+    for col in ["race", "insurance", "location", "ethnicity"]:
+        if col not in df:
+            df[col] = pd.NA
+    for col in ["egfr", "acr", *LABS, *VITALS[:-1], "weight_lbs"]:
+        if col not in df:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    df["MAP"] = (df["systolic_bp"] + 2 * df["diastolic_bp"]) / 3
+    for col, (lo, hi) in BAD_VALUE_LIMITS.items():
+        invalid = df[col].lt(lo)
+        if hi is not None:
+            invalid |= df[col].gt(hi)
+        df.loc[invalid, col] = np.nan
+    df["age"] = (df["lab_date"] - df["date_of_birth"]).dt.days / 365.25
+    df.loc[df["age"] < 0, "age"] = np.nan
+    for col in ["sex", "race", "insurance", "location"]:
+        df[col] = clean_category(df[col])
+    df["location"] = normalize_location(df["location"])
+    return df
+
+
+@st.cache_data(show_spinner="Computing longitudinal patient summaries…", ttl=3600)
+def make_patient_tables(df):
+    gfr = (df[["study_id", "lab_date", "egfr"]]
+           .dropna().groupby(["study_id", "lab_date"], as_index=False)["egfr"].median()
+           .sort_values(["study_id", "lab_date"]).reset_index(drop=True))
+    rows = []
+    for pid, group in gfr.groupby("study_id", sort=False):
+        if len(group) < 3:
+            continue
+        t = (group["lab_date"] - group["lab_date"].iloc[0]).dt.days.to_numpy() / 365.25
+        if t.max() < 1:
+            continue
+        values = group["egfr"].to_numpy(dtype=float)
+        rows.append({"study_id": pid, "annual_egfr_change": np.polyfit(t, values, 1)[0],
+                     "baseline_egfr": values[0], "final_egfr": values[-1],
+                     "n_egfr_observations": len(group), "years_followup": t.max(),
+                     "first_egfr_date": group["lab_date"].iloc[0]})
+    patient = pd.DataFrame(rows)
+    if patient.empty:
+        raise ValueError("No patients met the notebook's eGFR slope eligibility rules.")
+    patient["gfr_category"] = pd.cut(
+        patient["baseline_egfr"], bins=[-np.inf, 15, 30, 45, 60, 90, np.inf],
+        labels=["G5", "G4", "G3b", "G3a", "G2", "G1"], right=False).astype("string")
+    cats = df[["study_id", "lab_date", "encounter_date", "sex", "race", "insurance", "location"]].copy()
+    cats["record_date"] = cats["encounter_date"].fillna(cats["lab_date"])
+    cats = cats.sort_values("record_date", kind="stable")
+    latest = cats.groupby("study_id")[["sex", "race", "insurance", "location"]].agg(
+        lambda s: s.dropna().iloc[-1] if s.notna().any() else pd.NA).reset_index()
+    patient = patient.merge(latest, on="study_id", how="left")
+    births = df.groupby("study_id")["date_of_birth"].first().rename("date_of_birth")
+    patient = patient.join(births, on="study_id")
+    patient["baseline_age"] = (patient["first_egfr_date"] - patient["date_of_birth"]).dt.days / 365.25
+    # Patient medians: 1 median per calendar date, then median across distinct dates.
+    for feat in FEATURES:
+        source_date = df["encounter_date"].fillna(df["lab_date"]) if feat in VITALS else df["lab_date"]
+        work = pd.DataFrame({"study_id": df["study_id"], "date": source_date, "value": df[feat]}).dropna()
+        daily = work.groupby(["study_id", "date"], as_index=False)["value"].median()
+        aggregate = daily.groupby("study_id")["value"].agg(["median", "count"])
+        aggregate.loc[aggregate["count"] < 2, "median"] = np.nan
+        patient = patient.join(aggregate["median"].rename(f"median_{feat}"), on="study_id")
+    return gfr, patient
+
+
+def filter_patients(patient):
+    st.sidebar.subheader("Patient filters")
+    categories = st.sidebar.multiselect("Baseline GFR", GFR_ORDER, default=GFR_ORDER)
+    filtered = patient[patient["gfr_category"].isin(categories)].copy()
+    for col, label in [("sex", "Sex"), ("race", "Race"), ("location", "Location"), ("insurance", "Insurance")]:
+        choices = sorted(patient[col].dropna().astype(str).unique().tolist())
+        if len(choices) > 0:
+            selected = st.sidebar.multiselect(label, choices, default=choices)
+            filtered = filtered[filtered[col].isin(selected)]
+    age = filtered["baseline_age"].dropna()
+    if not age.empty:
+        lo, hi = max(0, int(np.floor(age.min()))), min(120, int(np.ceil(age.max())))
+        if lo < hi:
+            bounds = st.sidebar.slider("Baseline age (years)", lo, hi, (lo, hi))
+            filtered = filtered[filtered["baseline_age"].between(*bounds)]
+    return filtered
+
+
+def scatter_fit(x, y, use_log=False):
+    subset = pd.DataFrame({"x": x, "y": y}).replace([np.inf, -np.inf], np.nan).dropna()
+    if use_log:
+        subset = subset[subset.x > 0]
+    if len(subset) < 3 or subset.x.nunique() < 2 or subset.y.nunique() < 2:
+        return None
+    xx = np.log10(subset.x.to_numpy()) if use_log else subset.x.to_numpy()
+    yy = subset.y.to_numpy()
+    m, b = np.polyfit(xx, yy, 1)
+    r2 = 1 - ((yy - (m * xx + b))**2).sum() / ((yy - yy.mean())**2).sum()
+    return m, b, r2, len(subset), float(subset.x.min()), float(subset.x.max())
+
+
+def kfre_8_vectorized(rows, years):
+    male = rows["sex"].astype("string").str.lower().isin(["m", "male"]).astype(float)
+    lp = (-0.1992 * (rows.age / 10 - 7.036) + 0.1602 * (male - 0.5642)
+          - 0.4919 * (rows.egfr / 5 - 7.222) + 0.3364 * (np.log(rows.acr) - 5.137)
+          - 0.3441 * (rows.albumin - 3.997) + 0.2604 * (rows.phosphorus - 3.916)
+          - 0.07354 * (rows.co2 - 25.57) - 0.2228 * (rows.calcium - 9.355))
+    return 1 - (0.9780 if years == 2 else 0.9301) ** np.exp(lp)
+
+
+def find_low_egfr_window(measurements, period_start, period_end, threshold=15):
+    """Match notebook: complete calendar 3-month window with >=2 dates and mean below threshold."""
+    start, end = pd.Timestamp(period_start).normalize(), pd.Timestamp(period_end).normalize()
+    data = measurements[["lab_date", "egfr"]].dropna().copy()
+    data["lab_date"] = data["lab_date"].dt.normalize()
+    data = data.groupby("lab_date", as_index=False)["egfr"].median().sort_values("lab_date")
+    data = data[data.lab_date.between(start, end)]
+    if len(data) < 2:
+        return pd.NaT
+    last_start = end - pd.DateOffset(months=3)
+    if last_start < start:
+        return pd.NaT
+    starts = {start, last_start}
+    for d in data.lab_date:
+        starts.update([d, d + pd.Timedelta(days=1), d - pd.DateOffset(months=3),
+                       d - pd.DateOffset(months=3) + pd.Timedelta(days=1)])
+    for s in sorted(starts):
+        if start <= s <= last_start:
+            window_end = s + pd.DateOffset(months=3)
+            w = data[data.lab_date.between(s, window_end)]
+            if len(w) >= 2 and w.egfr.mean() < threshold:
+                return window_end
+    return pd.NaT
+
+
+@st.cache_data(show_spinner="Evaluating KFRE surrogate outcomes…", ttl=3600)
+def prepare_kfre(df, gfr):
+    cols = ["study_id", "lab_date", "age", "sex", "egfr", "acr", "albumin", "phosphorus", "co2", "calcium"]
+    candidates = df[cols].dropna().copy()
+    candidates["sex"] = candidates.sex.astype("string").str.strip().str.lower()
+    eligible = (candidates.age.ge(18) & candidates.egfr.ge(15) & candidates.egfr.lt(60)
+                & candidates.acr.gt(0) & candidates.sex.isin(["m", "male", "f", "female"])
+                & candidates[["albumin", "phosphorus", "co2", "calcium"]].gt(0).all(axis=1))
+    baseline = (candidates.loc[eligible].sort_values(["study_id", "lab_date"], kind="stable")
+                .drop_duplicates("study_id", keep="first")
+                .rename(columns={"lab_date": "baseline_date"}))
+    histories = {k: v for k, v in gfr.groupby("study_id", sort=False)}
+    usable = []
+    for row in baseline.itertuples():
+        history = histories.get(row.study_id)
+        if history is None:
+            continue
+        prior = history[history.lab_date.dt.normalize() < row.baseline_date.normalize()]
+        if len(prior) >= 2 and pd.notna(find_low_egfr_window(
+            prior, prior.lab_date.min() - pd.DateOffset(months=3), row.baseline_date, 15)):
+            continue
+        usable.append(row.Index)
+    baseline = baseline.loc[usable].copy()
+    last_dates = gfr.groupby("study_id")["lab_date"].max().rename("last_egfr_date")
+    baseline = baseline.join(last_dates, on="study_id")
+    output = {}
+    for years in [2, 5]:
+        risk = baseline.copy()
+        risk["predicted"] = kfre_8_vectorized(risk, years)
+        risk["horizon_date"] = risk.baseline_date + pd.DateOffset(years=years)
+        event_15, event_10 = [], []
+        for row in risk.itertuples():
+            hist = histories[row.study_id]
+            d = hist.lab_date.dt.normalize()
+            future = hist[(d > row.baseline_date.normalize()) & (d <= row.horizon_date.normalize())]
+            event_15.append(find_low_egfr_window(future, row.baseline_date, row.horizon_date, 15))
+            event_10.append(find_low_egfr_window(future, row.baseline_date, row.horizon_date, 10))
+        followup = risk.last_egfr_date >= risk.horizon_date
+        risk["event_15"] = np.where(pd.notna(event_15), 1, np.where(followup, 0, np.nan))
+        risk["event_10"] = np.where(pd.notna(event_10), 1, np.where(followup, 0, np.nan))
+        output[years] = risk
+    return output
+
+
+def kfre_summary(risk, threshold, paired):
+    work = risk.dropna(subset=["event_15", "event_10"] if paired else [f"event_{threshold}"]).copy()
+    if work.empty:
+        return pd.DataFrame()
+    work["risk_band"] = pd.cut(work.predicted, [0, .05, .10, .20, 1.000001],
+                               labels=["0–5%", "5–10%", "10–20%", "20%+"], right=False)
+    work = work.dropna(subset=["risk_band"])
+    result = (work.groupby("risk_band", observed=True).agg(
+        patients=("study_id", "size"), predicted=("predicted", "mean"),
+        events=(f"event_{threshold}", "sum")).reset_index())
+    if result.empty:
+        return result
+    result["observed"] = result.events / result.patients
+    ci = [binomtest(int(r.events), int(r.patients)).proportion_ci(method="wilson")
+          for r in result.itertuples()]
+    result["ci_lower"] = [p.low for p in ci]
+    result["ci_upper"] = [p.high for p in ci]
+    return result
+
+
+# Read and prepare source once; Streamlit caches across page/filter changes.
+try:
+    source = load_source(DATA_URL)
+    gfr, patients = make_patient_tables(source)
+except Exception as exc:
+    st.error(f"Unable to load/prepare source dataset: {exc}")
+    st.info("Confirm that the GitHub Raw URL is public and still returns CSV-formatted text.")
     st.stop()
 
 st.sidebar.title("Nephrology EDA")
-page = st.sidebar.radio(
-    "Explore", ["Population overview", "eGFR progression", "Laboratory associations", "KFRE evaluation"]
-)
-st.sidebar.markdown("---")
-st.sidebar.caption("Public presentation dashboard • aggregated data only")
-if meta["data_mode"] == "synthetic_demo":
-    st.warning("**SYNTHETIC DEMONSTRATION DATA.** All displayed numbers and relationships are illustrative, not results from the clinical dataset.")
-else:
-    st.info("Approved aggregate tables only. Clinical data have not been loaded into the public app.")
-
-
-def download_aggregate(frame, label, filename):
-    st.download_button(
-        label, data=frame.to_csv(index=False).encode("utf-8"),
-        file_name=filename, mime="text/csv"
-    )
-
-
-def fig_layout(fig, height=470):
-    fig.update_layout(height=height, margin=dict(l=20, r=20, t=45, b=35),
-                      plot_bgcolor="white", legend_title_text="")
-    return fig
-
-
-def subgroup_filter(frame, group):
-    return frame[frame["gfr_category"].eq(group)].copy()
-
+page = st.sidebar.radio("Explore", ["Population overview", "eGFR progression", "Laboratory associations", "KFRE evaluation"])
+filtered = filter_patients(patients)
+st.sidebar.caption("Public, approved study data • educational use only")
 
 if page == "Population overview":
     st.title("Population overview")
-    st.write("Explore cohort composition and data availability. Filters select a **single published summary**, not an arbitrary combination of patient-level variables.")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Source observations", f"{meta.get('n_rows', 0):,}")
-    col2.metric("Distinct source patients", f"{meta.get('n_patients', 0):,}")
-    col3.metric("Patients with eligible eGFR slope", f"{meta.get('n_slopes', 0):,}")
-    st.caption("Slope eligibility: ≥3 distinct-date eGFR measurements and ≥1 year of follow-up. Patient counts in published subgroups may not sum to the cohort total because small groups are withheld.")
-    dim_map = {"Baseline GFR category": "gfr_category", "Sex": "sex", "Race": "race",
-               "Insurance": "insurance", "Service location": "location"}
-    choice = st.selectbox("Compare groups", list(dim_map))
-    subset = data["overview"].loc[data["overview"]["dimension"] == dim_map[choice]].copy()
-    if subset.empty:
-        st.warning("No approved groups meet the disclosure threshold in this view.")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Source observations", f"{len(source):,}")
+    c2.metric("Patients in source", f"{source.study_id.nunique():,}")
+    c3.metric("Eligible slopes", f"{len(patients):,}")
+    c4.metric("Patients after filters", f"{len(filtered):,}")
+    st.caption("Filters apply to eligible patients (≥3 unique eGFR dates spanning ≥1 year). Source row/patient counts are unfiltered.")
+    group_col = st.selectbox("Compare", ["gfr_category", "sex", "race", "insurance", "location"])
+    group = (filtered.groupby(group_col, observed=True)["annual_egfr_change"]
+             .agg(patients="size", median_annual_slope="median").reset_index())
+    if not group.empty:
+        fig = px.bar(group, x=group_col, y="patients", color="median_annual_slope", text="patients",
+                     color_continuous_scale="RdBu", color_continuous_midpoint=0)
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(group, use_container_width=True, hide_index=True)
+        st.download_button("Download group summary", group.to_csv(index=False), "population_summary.csv", "text/csv")
     else:
-        if dim_map[choice] == "gfr_category":
-            subset["category"] = pd.Categorical(subset["category"], categories=GFR_ORDER, ordered=True)
-            subset = subset.sort_values("category")
-        fig = px.bar(subset, x="category", y="patients", text="patients",
-                     labels={"category": choice, "patients": "Patients"}, color="median_annual_slope",
-                     color_continuous_scale="RdBu", color_continuous_midpoint=0,
-                     hover_data=["median_baseline_egfr", "pct_declining"])
-        st.plotly_chart(fig_layout(fig), use_container_width=True)
-        st.dataframe(subset, hide_index=True, use_container_width=True)
-        download_aggregate(subset, "Download this aggregate table", "public_population_summary.csv")
-    st.caption("Age, lab dates, individual study IDs, individual records, and precise combinations of demographic characteristics are not exposed.")
+        st.warning("No patients match the selected filters.")
+    st.caption("These records were approved for public use, but downloaded tables on this page contain aggregates only.")
 
 elif page == "eGFR progression":
     st.title("eGFR progression")
-    st.write("Patient-level annual slopes were calculated from daily-median eGFR observations. The histogram shows disclosure-screened counts of those slopes.")
-    category = st.selectbox("Population", ["All", *GFR_ORDER])
-    hist = subgroup_filter(data["distributions"], category)
+    if filtered.empty:
+        st.info("No patients match the current filters.")
+        st.stop()
+    fig = px.histogram(filtered, x="annual_egfr_change", nbins=65,
+                       labels={"annual_egfr_change": "Annual eGFR change (mL/min/1.73 m²/year)"})
+    fig.add_vline(x=0, line_dash="dash", line_color="red")
+    st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Individual longitudinal trajectory")
+    patient_ids = sorted(filtered.study_id.astype(str).unique())
+    pid = st.selectbox("Study ID", patient_ids)
+    hist = gfr[gfr.study_id.eq(pid)].sort_values("lab_date").copy()
     if not hist.empty:
-        fig = px.bar(hist, x="bin_center", y="patients", labels={"bin_center": "Annual eGFR slope (mL/min/1.73 m²/year)", "patients": "Patients"})
-        fig.add_vline(x=0, line_dash="dash", line_color="#B34C40")
-        st.plotly_chart(fig_layout(fig), use_container_width=True)
-        st.caption("Bins with fewer than the publication threshold are omitted; this is not a complete reconstruction of the patient-level histogram.")
-        download_aggregate(hist, "Download slope distribution summary", "public_slope_histogram.csv")
-    else:
-        st.info("No publishable histogram bins for this group.")
-    st.subheader("Trajectory explorer — synthetic examples")
-    st.write("The interactive trajectories below are **simulated**, not actual patients. This design retains the explanatory feature without publishing recognizable medical histories.")
-    example = st.selectbox("Illustrative pattern", ["Gradual decline", "Stable with noise", "Acute drop and partial recovery", "Accelerating decline"])
-    seed = st.number_input("Synthetic random seed", min_value=0, max_value=999999, value=6500, step=1)
-    rng = np.random.default_rng(int(seed))
-    t = np.linspace(0, 5, 20)
-    patterns = {
-        "Gradual decline": 60 - 2.4*t,
-        "Stable with noise": 44 + 0*t,
-        "Acute drop and partial recovery": 54 - 1.1*t - 18*np.exp(-((t-2.4)/0.38)**2),
-        "Accelerating decline": 64 - 0.8*t - 0.85*t*t,
-    }
-    observed = patterns[example] + rng.normal(0, 3.8, len(t))
-    fit = np.polyval(np.polyfit(t, observed, 1), t)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=t, y=observed, mode="markers", name="Synthetic observations"))
-    fig.add_trace(go.Scatter(x=t, y=fit, mode="lines", name="Linear fit"))
-    fig.add_trace(go.Scatter(x=t, y=patterns[example], mode="lines", name="Simulation's underlying curve", line=dict(dash="dash")))
-    fig.update_layout(xaxis_title="Years", yaxis_title="eGFR (mL/min/1.73 m²)")
-    st.plotly_chart(fig_layout(fig), use_container_width=True)
+        hist["years"] = (hist.lab_date - hist.lab_date.iloc[0]).dt.days / 365.25
+        slope, intercept = np.polyfit(hist.years, hist.egfr, 1)
+        fig = px.scatter(hist, x="lab_date", y="egfr", title=f"Study ID {pid}: {len(hist)} unique-date eGFR values")
+        fig.add_trace(go.Scatter(x=hist.lab_date, y=intercept + slope * hist.years,
+                                 mode="lines", name=f"OLS slope {slope:+.2f}/year"))
+        st.plotly_chart(fig, use_container_width=True)
+        st.download_button("Download this patient's approved eGFR history",
+                           hist[["lab_date", "egfr"]].to_csv(index=False),
+                           f"egfr_{pid}.csv", "text/csv")
 
 elif page == "Laboratory associations":
-    st.title("Laboratory associations")
-    st.write("Explore aggregated measurement bins and original patient-level regression summaries generated offline. A displayed point is an **aggregate bin**, not a patient.")
-    feature = st.selectbox("Median measurement", list(FEATURE_LABELS), format_func=lambda k: FEATURE_LABELS[k])
-    group = st.selectbox("Baseline GFR category", ["All", *GFR_ORDER])
-    band_options = ["All"] if feature != "acr" else ["A1", "A2", "A3"]
-    band = st.selectbox("Albuminuria range" if feature == "acr" else "Relationship", band_options)
-    subset = data["associations"]
-    subset = subset[(subset["feature"] == feature) & (subset["gfr_category"] == group) & (subset["band"] == band)]
-    reg = data["regressions"]
-    reg = reg[(reg["feature"] == feature) & (reg["gfr_category"] == group) & (reg["band"] == band)]
-    if subset.empty:
-        st.info("No approved aggregate bins exist for this selection.")
-    else:
-        fig = px.scatter(subset, x="x_median", y="y_median", size="patients",
-                         hover_data=["patients"], labels={"x_median": FEATURE_LABELS[feature], "y_median": "Median annual eGFR slope"},
-                         title="Aggregated bins: median eGFR slope vs. median measurement")
-        if feature == "acr":
-            fig.update_xaxes(type="log")
-        if not reg.empty:
-            r = reg.iloc[0]
-            xlow, xhigh = float(subset.x_median.min()), float(subset.x_median.max())
-            if xlow < xhigh:
-                xx = np.geomspace(xlow, xhigh, 100) if feature == "acr" else np.linspace(xlow, xhigh, 100)
-                predictor = np.log10(xx) if feature == "acr" else xx
-                yy = float(r["intercept"]) + float(r["slope"])*predictor
-                fig.add_trace(go.Scatter(x=xx, y=yy, name="Patient-level OLS summary", mode="lines", line=dict(color="#C34E49")))
-                label = "log₁₀(ACR)" if feature == "acr" else "x"
-                st.caption(f"Patient-level OLS fit: y = {r['slope']:.3g} × {label} {r['intercept']:+.3g}; R² = {r['r_squared']:.3f}; n = {int(r['patients']):,}. The fit is calculated offline; plotted dots are grouped summaries.")
-        fig.add_hline(y=0, line_dash="dash", line_color="gray")
-        st.plotly_chart(fig_layout(fig), use_container_width=True)
-        download_aggregate(subset, "Download aggregate scatter data", f"public_{feature}_{group}_{band}_bins.csv")
-    st.caption("Medians summarize each patient's available history; these are descriptive associations, not evidence of prospective prediction or causation.")
+    st.title("Laboratory and vital-sign associations")
+    st.caption("Medians are calculated across each patient's available history (≥2 distinct dates); associations are descriptive and not prospective predictions.")
+    feat = st.selectbox("Median variable", FEATURES)
+    plot = filtered[["study_id", "annual_egfr_change", f"median_{feat}", "gfr_category", "baseline_age"]].dropna().copy()
+    if feat == "acr":
+        band = st.selectbox("ACR interval", ["All", "A1: 0–30", "A2: 30–300", "A3: 300+"])
+        plot = plot[plot[f"median_{feat}"] > 0]
+        if band.startswith("A1"):
+            plot = plot[plot.median_acr.lt(30)]
+        elif band.startswith("A2"):
+            plot = plot[plot.median_acr.ge(30) & plot.median_acr.lt(300)]
+        elif band.startswith("A3"):
+            plot = plot[plot.median_acr.ge(300)]
+    if len(plot) < 3:
+        st.info("Too few observations for a regression with these filters.")
+        st.stop()
+    xcol = f"median_{feat}"
+    use_log = feat == "acr"
+    fig = px.scatter(plot, x=xcol, y="annual_egfr_change", color="baseline_age",
+                     hover_data=["study_id", "gfr_category"], opacity=0.65,
+                     labels={xcol: f"Patient median {feat}", "annual_egfr_change": "Annual eGFR slope"})
+    if use_log:
+        fig.update_xaxes(type="log")
+    result = scatter_fit(plot[xcol], plot.annual_egfr_change, use_log=use_log)
+    if result:
+        m, b, r2, n, xmin, xmax = result
+        xx = np.geomspace(xmin, xmax, 100) if use_log else np.linspace(xmin, xmax, 100)
+        yy = m * (np.log10(xx) if use_log else xx) + b
+        fig.add_trace(go.Scatter(x=xx, y=yy, mode="lines", name="OLS regression", line=dict(color="red", width=3)))
+        st.write(f"OLS: **slope = {m:.3g}**, **intercept = {b:+.3g}**, **R² = {r2:.3f}**, **n = {n:,}**. "
+                 + ("Predictor is log₁₀(ACR)." if use_log else "Predictor is the patient median."))
+    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+    st.plotly_chart(fig, use_container_width=True)
+    st.download_button("Download selected approved scatter data", plot.to_csv(index=False),
+                       f"lab_{feat}_selected.csv", "text/csv")
 
 else:
-    st.title("Kidney Failure Risk Equation: surrogate-outcome comparison")
-    st.warning("**Not a clinical validation of KFRE.** The original KFRE predicts kidney failure requiring kidney replacement therapy. This project evaluates whether a three-month *window containing ≥2 distinct-date eGFR values whose mean is below a threshold* was detected. It does not establish sustained low eGFR, dialysis, transplantation, or kidney failure outcomes.")
-    horizon = st.radio("Prediction horizon", [2, 5], horizontal=True, format_func=lambda k: f"{k} years")
-    threshold = st.radio("Surrogate mean-eGFR threshold", [15, 10], horizontal=True, format_func=lambda k: f"Below {k}")
-    paired_only = st.checkbox("Use paired evaluable cohort (same patients for both thresholds)", value=True)
-    subset = data["kfre"]
-    subset = subset[(subset["years"] == horizon) & (subset["threshold"] == threshold) & (subset["cohort"] == ("paired" if paired_only else "threshold_specific"))]
-    if subset.empty:
-        st.info("No publishable risk bands meet the cohort/disclosure requirements.")
-    else:
-        x = subset["mean_predicted"] * 100
-        y = subset["observed_rate"] * 100
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=[0,100], y=[0,100], mode="lines", name="Identity (not expected for surrogate)", line=dict(dash="dash", color="gray")))
-        fig.add_trace(go.Scatter(x=x, y=y, mode="markers+lines", name="Observed low-eGFR surrogate rate",
-                                 marker=dict(size=10), text=subset["risk_band"],
-                                 error_y=dict(type="data", symmetric=False, array=(subset["ci_upper"]-subset["observed_rate"])*100, arrayminus=(subset["observed_rate"]-subset["ci_lower"])*100)))
-        if len(subset) >= 2 and x.nunique() > 1:
-            weights = subset["patients"].to_numpy(dtype=float)
-            slope, intercept = np.polyfit(x.to_numpy(), y.to_numpy(), 1, w=np.sqrt(weights))
-            xx = np.linspace(x.min(), x.max(), 100)
-            fig.add_trace(go.Scatter(x=xx, y=intercept+slope*xx, mode="lines", name=f"Binned WLS fit: y={slope:.2f}x{intercept:+.2f}"))
-        fig.update_layout(xaxis_title="Mean predicted KFRE risk (%)", yaxis_title="Observed low-eGFR surrogate event rate (%)", xaxis_range=[0,100], yaxis_range=[0,100])
-        st.plotly_chart(fig_layout(fig), use_container_width=True)
-        show = subset[["risk_band", "patients", "mean_predicted", "observed_events", "observed_rate", "ci_lower", "ci_upper"]]
-        st.dataframe(show, hide_index=True, use_container_width=True)
-        download_aggregate(show, "Download aggregate KFRE table", f"public_kfre_{horizon}y_{threshold}_{'paired' if paired_only else 'specific'}.csv")
-    st.caption("A qualifying window can contain just two nearby laboratory dates; it does **not** require 3 months of persistent low eGFR. Follow-up censoring and unmatched clinical outcomes limit interpretation. The dashed identity line is only a visual reference, not a standard of expected calibration under this surrogate definition.")
+    st.title("KFRE: low-eGFR surrogate-endpoint analysis")
+    st.warning("KFRE predicts kidney failure treated with kidney replacement therapy. "
+               "This EDA instead detects a 3-month window with ≥2 distinct-date eGFR values whose mean is below 15 or 10. "
+               "It **does not** establish 3-month persistence, dialysis initiation, transplantation, or formal KFRE calibration.")
+    years = st.radio("KFRE horizon", [2, 5], horizontal=True)
+    threshold = st.radio("Mean eGFR below", [15, 10], horizontal=True)
+    paired = st.checkbox("Compare using patients evaluable under both thresholds", value=True)
+    with st.spinner("Preparing KFRE risk and observed surrogate events…"):
+        risks = prepare_kfre(source, gfr)
+    risk = risks[years]
+    # For this page use the full original KFRE-eligible population: it need not have an eligible slope.
+    summary = kfre_summary(risk, threshold, paired)
+    st.caption(f"KFRE baseline population: {len(risk):,}; evaluable outcome population in selected cohort: "
+               f"{len(risk.dropna(subset=['event_15', 'event_10'] if paired else [f'event_{threshold}'])):,}.")
+    if summary.empty:
+        st.info("No evaluable risk bands available.")
+        st.stop()
+    x, y = summary.predicted * 100, summary.observed * 100
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=[0, 100], y=[0, 100], mode="lines", name="Identity reference (not expected for surrogate)",
+                             line=dict(color="gray", dash="dash")))
+    fig.add_trace(go.Scatter(x=x, y=y, mode="markers+lines", name=f"Observed eGFR <{threshold} window",
+                             text=summary.risk_band,
+                             error_y=dict(type="data", symmetric=False,
+                                          array=(summary.ci_upper - summary.observed)*100,
+                                          arrayminus=(summary.observed - summary.ci_lower)*100)))
+    if len(summary) > 1 and x.nunique() > 1:
+        m, b = np.polyfit(x.to_numpy(), y.to_numpy(), 1, w=np.sqrt(summary.patients.to_numpy()))
+        grid = np.linspace(x.min(), x.max(), 100)
+        fig.add_trace(go.Scatter(x=grid, y=m*grid+b, mode="lines", name=f"Binned WLS: y={m:.2f}x{b:+.2f}"))
+    fig.update_layout(xaxis_title="Mean predicted KFRE risk (%)", yaxis_title="Observed low-eGFR surrogate event rate (%)",
+                      xaxis_range=[0, 100], yaxis_range=[0, 100])
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(summary, hide_index=True, use_container_width=True)
+    st.download_button("Download selected KFRE aggregate table", summary.to_csv(index=False),
+                       f"kfre_{years}yr_threshold{threshold}.csv", "text/csv")
+    st.caption("The choice of 10 versus 15 changes which censored patients can be classified. "
+               "KFRE risk is based on earliest eligible complete baseline; subsequent follow-up dates determine the surrogate event.")
 
 st.divider()
-st.caption("Educational exploratory data analysis. Not for clinical decisions, patient-level care, or individual kidney-failure risk estimation.")
+st.caption("Approved educational EDA dataset • descriptive only • not for clinical decisions")
+
