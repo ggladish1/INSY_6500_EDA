@@ -290,12 +290,14 @@ if page == "Population overview":
     if not group.empty:
         fig = px.bar(group, x=group_col, y="patients", color="median_annual_slope", text="patients",
                      color_continuous_scale="RdBu", color_continuous_midpoint=0)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={"modeBarButtonsToRemove": ["toImage"]}
+        )
         st.dataframe(group, use_container_width=True, hide_index=True)
-        st.download_button("Download group summary", group.to_csv(index=False), "population_summary.csv", "text/csv")
     else:
         st.warning("No patients match the selected filters.")
-    st.caption("These records were approved for public use, but downloaded tables on this page contain aggregates only.")
 
 elif page == "eGFR progression":
     st.title("eGFR progression")
@@ -305,7 +307,11 @@ elif page == "eGFR progression":
     fig = px.histogram(filtered, x="annual_egfr_change", nbins=65,
                        labels={"annual_egfr_change": "Annual eGFR change (mL/min/1.73 m²/year)"})
     fig.add_vline(x=0, line_dash="dash", line_color="red")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={"modeBarButtonsToRemove": ["toImage"]}
+        )
     st.subheader("Individual longitudinal trajectory")
     patient_ids = sorted(filtered.study_id.astype(str).unique())
     pid = st.selectbox("Study ID", patient_ids)
@@ -316,10 +322,11 @@ elif page == "eGFR progression":
         fig = px.scatter(hist, x="lab_date", y="egfr", title=f"Study ID {pid}: {len(hist)} unique-date eGFR values")
         fig.add_trace(go.Scatter(x=hist.lab_date, y=intercept + slope * hist.years,
                                  mode="lines", name=f"OLS slope {slope:+.2f}/year"))
-        st.plotly_chart(fig, use_container_width=True)
-        st.download_button("Download this patient's approved eGFR history",
-                           hist[["lab_date", "egfr"]].to_csv(index=False),
-                           f"egfr_{pid}.csv", "text/csv")
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={"modeBarButtonsToRemove": ["toImage"]}
+        )
 
 elif page == "Laboratory associations":
     st.title("Laboratory and vital-sign associations")
@@ -354,9 +361,11 @@ elif page == "Laboratory associations":
         st.write(f"OLS: **slope = {m:.3g}**, **intercept = {b:+.3g}**, **R² = {r2:.3f}**, **n = {n:,}**. "
                  + ("Predictor is log₁₀(ACR)." if use_log else "Predictor is the patient median."))
     fig.add_hline(y=0, line_dash="dash", line_color="gray")
-    st.plotly_chart(fig, use_container_width=True)
-    st.download_button("Download selected approved scatter data", plot.to_csv(index=False),
-                       f"lab_{feat}_selected.csv", "text/csv")
+    st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={"modeBarButtonsToRemove": ["toImage"]}
+        )
 
 else:
     st.title("KFRE: low-eGFR surrogate-endpoint analysis")
@@ -391,10 +400,12 @@ else:
         fig.add_trace(go.Scatter(x=grid, y=m*grid+b, mode="lines", name=f"Binned WLS: y={m:.2f}x{b:+.2f}"))
     fig.update_layout(xaxis_title="Mean predicted KFRE risk (%)", yaxis_title="Observed low-eGFR surrogate event rate (%)",
                       xaxis_range=[0, 100], yaxis_range=[0, 100])
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={"modeBarButtonsToRemove": ["toImage"]}
+        )
     st.dataframe(summary, hide_index=True, use_container_width=True)
-    st.download_button("Download selected KFRE aggregate table", summary.to_csv(index=False),
-                       f"kfre_{years}yr_threshold{threshold}.csv", "text/csv")
     st.caption("The choice of 10 versus 15 changes which censored patients can be classified. "
                "KFRE risk is based on earliest eligible complete baseline; subsequent follow-up dates determine the surrogate event.")
 
