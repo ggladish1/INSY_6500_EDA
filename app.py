@@ -34,8 +34,31 @@ FEATURES = ["acr", *LABS, *VITALS]
 BAD_VALUE_LIMITS = {
     "egfr": (0, 150), "acr": (0, None), "creatinine": (0, 20),
     "glucose": (0, 600), "calcium": (0, 15), "potassium": (0, 8),
-    "hemoglobin": (0, 18), "phosphorus": (0, 15), "co2": (0, 45)
+    "hemoglobin": (0, 18), "phosphorus": (0, 15), "co2": (0, 45),
+    "systolic_bp": (0, 300), "diastolic_bp": (0, 200)
 }
+# Exploratory measurement bands, assuming conventional US units.
+# These are illustrative thresholds, NOT patient-specific diagnostic limits.
+# Glucose is not reliably fasting; hemoglobin and creatinine ranges vary by sex.
+REFERENCE_RANGES = {
+    "calcium": (8.5, 10.5),       # mg/dL
+    "potassium": (3.5, 5.0),      # mmol/L
+    "hemoglobin": (12.0, 17.5),   # g/dL, pooled illustrative bounds
+    "phosphorus": (2.5, 4.5),     # mg/dL
+    "glucose": (70.0, 140.0),     # mg/dL, exploratory; fasting status unknown
+    "co2": (22.0, 29.0),          # mmol/L
+    "albumin": (3.5, 5.0),        # g/dL
+    "creatinine": (0.6, 1.3),     # mg/dL, pooled illustrative bounds
+}
+BAND_COLORS = {"Low": "#4575b4", "Normal": "#27936b", "High": "#d6812f"}
+MISSING_LABEL = "(Missing / unknown)"
+
+
+def measurement_band(values, lower, upper):
+    """Classify continuous measurements using low < lower <= normal <= upper < high."""
+    return np.select([values < lower, values <= upper], ["Low", "Normal"], default="High")
+
+
 REQUIRED = ["study_id", "lab_date", "date_of_birth", "sex", "egfr", "acr", "albumin", "phosphorus", "co2", "calcium"]
 
 
@@ -76,12 +99,13 @@ def load_source(url):
         if col not in df:
             df[col] = np.nan
         df[col] = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    df["MAP"] = (df["systolic_bp"] + 2 * df["diastolic_bp"]) / 3
     for col, (lo, hi) in BAD_VALUE_LIMITS.items():
         invalid = df[col].lt(lo)
         if hi is not None:
             invalid |= df[col].gt(hi)
         df.loc[invalid, col] = np.nan
+    # Compute MAP only after removing erroneous BP measurements.
+    df["MAP"] = (df["systolic_bp"] + 2 * df["diastolic_bp"]) / 3
     df["age"] = (df["lab_date"] - df["date_of_birth"]).dt.days / 365.25
     df.loc[df["age"] < 0, "age"] = np.nan
     for col in ["sex", "race", "insurance", "location"]:
@@ -134,21 +158,36 @@ def make_patient_tables(df):
 
 
 def filter_patients(patient):
+    """Apply selections sequentially; preserve missing data by default."""
     st.sidebar.subheader("Patient filters")
+    filtered = patient.copy()
+    counts = [("Eligible longitudinal slopes", len(filtered))]
+
     categories = st.sidebar.multiselect("Baseline GFR", GFR_ORDER, default=GFR_ORDER)
-    filtered = patient[patient["gfr_category"].isin(categories)].copy()
-    for col, label in [("sex", "Sex"), ("race", "Race"), ("location", "Location"), ("insurance", "Insurance")]:
-        choices = sorted(patient[col].dropna().astype(str).unique().tolist())
-        if len(choices) > 0:
-            selected = st.sidebar.multiselect(label, choices, default=choices)
-            filtered = filtered[filtered[col].isin(selected)]
-    age = filtered["baseline_age"].dropna()
-    if not age.empty:
-        lo, hi = max(0, int(np.floor(age.min()))), min(120, int(np.ceil(age.max())))
+    filtered = filtered[filtered["gfr_category"].isin(categories)].copy()
+    counts.append(("After GFR category", len(filtered)))
+
+    for col, label in [("sex", "Sex"), ("race", "Race"),
+                       ("location", "Location"), ("insurance", "Insurance")]:
+        values = patient[col].fillna(MISSING_LABEL).astype(str)
+        choices = sorted(values.unique().tolist())
+        # Including the missing category avoids a hidden loss of patients.
+        selected = st.sidebar.multiselect(label, choices, default=choices)
+        filtered = filtered[filtered[col].fillna(MISSING_LABEL).astype(str).isin(selected)].copy()
+        counts.append((f"After {label.lower()}", len(filtered)))
+
+    ages = patient["baseline_age"].dropna()
+    if not ages.empty:
+        lo, hi = max(0, int(np.floor(ages.min()))), min(120, int(np.ceil(ages.max())))
         if lo < hi:
             bounds = st.sidebar.slider("Baseline age (years)", lo, hi, (lo, hi))
-            filtered = filtered[filtered["baseline_age"].between(*bounds)]
-    return filtered
+            include_missing = st.sidebar.checkbox("Include missing baseline ages", value=True)
+            age_mask = filtered["baseline_age"].between(*bounds)
+            if include_missing:
+                age_mask |= filtered["baseline_age"].isna()
+            filtered = filtered[age_mask].copy()
+    counts.append(("After baseline age", len(filtered)))
+    return filtered, pd.DataFrame(counts, columns=["Selection step", "Patients remaining"])
 
 
 def scatter_fit(x, y, use_log=False):
@@ -273,7 +312,7 @@ except Exception as exc:
 
 st.sidebar.title("Nephrology EDA")
 page = st.sidebar.radio("Explore", ["Population overview", "eGFR progression", "Laboratory associations", "KFRE evaluation"])
-filtered = filter_patients(patients)
+filtered, filter_audit = filter_patients(patients)
 st.sidebar.caption("Public, approved study data • educational use only")
 
 if page == "Population overview":
@@ -283,19 +322,25 @@ if page == "Population overview":
     c2.metric("Patients in source", f"{source.study_id.nunique():,}")
     c3.metric("Eligible slopes", f"{len(patients):,}")
     c4.metric("Patients after filters", f"{len(filtered):,}")
-    st.caption("Filters apply to eligible patients (≥3 unique eGFR dates spanning ≥1 year). Source row/patient counts are unfiltered.")
+    st.caption("Eligible slopes require ≥3 unique eGFR dates spanning ≥1 year. Source totals are unfiltered. "
+               "Missing sex/race/location/insurance values are now included by default, "
+               "rather than implicitly removed by the multiselect controls.")
+    with st.expander("Why does the number of patients change?", expanded=True):
+        st.write("Every sidebar filter acts on the patients remaining after the previous filter. "
+                 "The same filtered cohort is used by the eGFR histogram and laboratory scatterplots. "
+                 "The KFRE page uses its own eligibility criteria.")
+        audit = filter_audit.copy()
+        audit["Removed in step"] = audit["Patients remaining"].shift(1).sub(audit["Patients remaining"]).fillna(0).astype(int)
+        st.table(audit)
+        st.caption("Individual charts can require additional nonmissing measurements; their n may be smaller.")
     group_col = st.selectbox("Compare", ["gfr_category", "sex", "race", "insurance", "location"])
     group = (filtered.groupby(group_col, observed=True)["annual_egfr_change"]
              .agg(patients="size", median_annual_slope="median").reset_index())
     if not group.empty:
         fig = px.bar(group, x=group_col, y="patients", color="median_annual_slope", text="patients",
                      color_continuous_scale="RdBu", color_continuous_midpoint=0)
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config={"modeBarButtonsToRemove": ["toImage"]}
-        )
-        st.dataframe(group, use_container_width=True, hide_index=True)
+        st.plotly_chart(fig, use_container_width=True, config={"modeBarButtonsToRemove": ["toImage"]})
+        st.table(group)
     else:
         st.warning("No patients match the selected filters.")
 
@@ -307,11 +352,7 @@ elif page == "eGFR progression":
     fig = px.histogram(filtered, x="annual_egfr_change", nbins=65,
                        labels={"annual_egfr_change": "Annual eGFR change (mL/min/1.73 m²/year)"})
     fig.add_vline(x=0, line_dash="dash", line_color="red")
-    st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config={"modeBarButtonsToRemove": ["toImage"]}
-        )
+    st.plotly_chart(fig, use_container_width=True, config={"modeBarButtonsToRemove": ["toImage"]})
     st.subheader("Individual longitudinal trajectory")
     patient_ids = sorted(filtered.study_id.astype(str).unique())
     pid = st.selectbox("Study ID", patient_ids)
@@ -322,50 +363,94 @@ elif page == "eGFR progression":
         fig = px.scatter(hist, x="lab_date", y="egfr", title=f"Study ID {pid}: {len(hist)} unique-date eGFR values")
         fig.add_trace(go.Scatter(x=hist.lab_date, y=intercept + slope * hist.years,
                                  mode="lines", name=f"OLS slope {slope:+.2f}/year"))
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config={"modeBarButtonsToRemove": ["toImage"]}
-        )
+        st.plotly_chart(fig, use_container_width=True, config={"modeBarButtonsToRemove": ["toImage"]})
 
 elif page == "Laboratory associations":
     st.title("Laboratory and vital-sign associations")
-    st.caption("Medians are calculated across each patient's available history (≥2 distinct dates); associations are descriptive and not prospective predictions.")
+    st.caption("Each dot is a patient median across available measurements on ≥2 distinct dates. "
+               "Medians and slopes may cover overlapping periods, so these are descriptive associations, not prospective predictors.")
     feat = st.selectbox("Median variable", FEATURES)
-    plot = filtered[["study_id", "annual_egfr_change", f"median_{feat}", "gfr_category", "baseline_age"]].dropna().copy()
-    if feat == "acr":
-        band = st.selectbox("ACR interval", ["All", "A1: 0–30", "A2: 30–300", "A3: 300+"])
-        plot = plot[plot[f"median_{feat}"] > 0]
-        if band.startswith("A1"):
-            plot = plot[plot.median_acr.lt(30)]
-        elif band.startswith("A2"):
-            plot = plot[plot.median_acr.ge(30) & plot.median_acr.lt(300)]
-        elif band.startswith("A3"):
-            plot = plot[plot.median_acr.ge(300)]
-    if len(plot) < 3:
-        st.info("Too few observations for a regression with these filters.")
-        st.stop()
     xcol = f"median_{feat}"
+    plot = filtered[["study_id", "annual_egfr_change", xcol, "gfr_category", "baseline_age"]].dropna(
+        subset=[xcol, "annual_egfr_change"]).copy()
     use_log = feat == "acr"
+
+    if use_log:
+        plot = plot[plot[xcol] > 0].copy()
+        options = ["All", "A1: 0–30", "A2: 30–300", "A3: 300+"]
+        selected_band = st.selectbox("ACR interval", options)
+        edges = (30.0, 300.0)
+        low_name, normal_name, high_name = options[1:]
+        plot["band"] = np.select(
+            [plot[xcol] < 30, plot[xcol] < 300],
+            [low_name, normal_name], default=high_name)
+    elif feat in REFERENCE_RANGES:
+        reference_low, reference_high = REFERENCE_RANGES[feat]
+        st.caption("Reference bands are *illustrative* rather than patient-specific laboratory reference intervals. "
+                   "Verify units and laboratory-specific ranges; glucose fasting status is unknown, "
+                   "and creatinine/hemoglobin vary by patient characteristics.")
+        left, right = st.columns(2)
+        with left:
+            lower = st.number_input(f"Low / normal boundary for {feat}",
+                                    min_value=0.0, value=float(reference_low), step=0.1, key=f"low_{feat}")
+        with right:
+            upper = st.number_input(f"Normal / high boundary for {feat}",
+                                    min_value=0.0, value=float(reference_high), step=0.1, key=f"high_{feat}")
+        if lower >= upper:
+            st.error("The low/normal boundary must be smaller than the normal/high boundary.")
+            st.stop()
+        plot["band"] = measurement_band(plot[xcol], lower, upper)
+        options = ["All", "Low", "Normal", "High"]
+        selected_band = st.selectbox("Measurement interval", options)
+    else:
+        selected_band = "All"
+        options = ["All"]
+        plot["band"] = "All"
+
+    if selected_band != "All":
+        plot = plot[plot["band"] == selected_band].copy()
+    if len(plot) < 3:
+        st.info("Too few patients remain after applying these filters.")
+        st.stop()
+
     fig = px.scatter(plot, x=xcol, y="annual_egfr_change", color="baseline_age",
-                     hover_data=["study_id", "gfr_category"], opacity=0.65,
-                     labels={xcol: f"Patient median {feat}", "annual_egfr_change": "Annual eGFR slope"})
+                     hover_data=["study_id", "gfr_category", "band"], opacity=0.65,
+                     labels={xcol: f"Patient median {feat}",
+                             "annual_egfr_change": "Annual eGFR slope"},
+                     color_continuous_scale="Viridis")
     if use_log:
         fig.update_xaxes(type="log")
-    result = scatter_fit(plot[xcol], plot.annual_egfr_change, use_log=use_log)
-    if result:
+    fit_groups = [selected_band] if selected_band != "All" else (
+        options[1:] if len(options) > 1 else ["All"])
+    results = []
+    line_colors = {
+        "A1: 0–30": "#4575b4", "A2: 30–300": "#27936b", "A3: 300+": "#d6812f",
+        "Low": "#4575b4", "Normal": "#27936b", "High": "#d6812f", "All": "#c33e43"
+    }
+    for name in fit_groups:
+        piece = plot if name == "All" else plot[plot["band"] == name]
+        result = scatter_fit(piece[xcol], piece.annual_egfr_change, use_log=use_log)
+        if result is None:
+            continue
         m, b, r2, n, xmin, xmax = result
         xx = np.geomspace(xmin, xmax, 100) if use_log else np.linspace(xmin, xmax, 100)
         yy = m * (np.log10(xx) if use_log else xx) + b
-        fig.add_trace(go.Scatter(x=xx, y=yy, mode="lines", name="OLS regression", line=dict(color="red", width=3)))
-        st.write(f"OLS: **slope = {m:.3g}**, **intercept = {b:+.3g}**, **R² = {r2:.3f}**, **n = {n:,}**. "
-                 + ("Predictor is log₁₀(ACR)." if use_log else "Predictor is the patient median."))
+        fig.add_trace(go.Scatter(x=xx, y=yy, mode="lines", line=dict(color=line_colors[name], width=3),
+                                 name=f"{name}: y={m:.3g}x{b:+.3g}, R²={r2:.3f}, n={n:,}"))
+        results.append({"Band": name, "Patients": n, "Slope": m,
+                        "Intercept": b, "R²": r2})
     fig.add_hline(y=0, line_dash="dash", line_color="gray")
-    st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config={"modeBarButtonsToRemove": ["toImage"]}
-        )
+    if selected_band == "All" and len(options) > 1:
+        edges_to_show = (30.0, 300.0) if use_log else (lower, upper)
+        for edge in edges_to_show:
+            fig.add_vline(x=edge, line_dash="dot", line_color="gray", opacity=0.5)
+    st.plotly_chart(fig, use_container_width=True, config={"modeBarButtonsToRemove": ["toImage"]})
+    st.caption("Regression x is log₁₀(ACR) for ACR, and the untransformed patient median otherwise. "
+               "Each subgroup has its own least-squares fit. R² describes within-band variance explained.")
+    if results:
+        st.table(pd.DataFrame(results).round(4))
+    else:
+        st.info("There are insufficient distinct measurements to fit a line for the selected subgroup.")
 
 else:
     st.title("KFRE: low-eGFR surrogate-endpoint analysis")
@@ -400,15 +485,10 @@ else:
         fig.add_trace(go.Scatter(x=grid, y=m*grid+b, mode="lines", name=f"Binned WLS: y={m:.2f}x{b:+.2f}"))
     fig.update_layout(xaxis_title="Mean predicted KFRE risk (%)", yaxis_title="Observed low-eGFR surrogate event rate (%)",
                       xaxis_range=[0, 100], yaxis_range=[0, 100])
-    st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config={"modeBarButtonsToRemove": ["toImage"]}
-        )
-    st.dataframe(summary, hide_index=True, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={"modeBarButtonsToRemove": ["toImage"]})
+    st.table(summary)
     st.caption("The choice of 10 versus 15 changes which censored patients can be classified. "
                "KFRE risk is based on earliest eligible complete baseline; subsequent follow-up dates determine the surrogate event.")
 
 st.divider()
 st.caption("Approved educational EDA dataset • descriptive only • not for clinical decisions")
-
