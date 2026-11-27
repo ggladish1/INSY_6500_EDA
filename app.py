@@ -49,6 +49,9 @@ REFERENCE_RANGES = {
     "co2": (22.0, 29.0),          # mmol/L
     "albumin": (3.5, 5.0),        # g/dL
     "creatinine": (0.6, 1.3),     # mg/dL, pooled illustrative bounds
+    "systolic_bp": (130.0, 150.0),
+    "diastolic_bp": (60.0, 80.0),
+    "MAP": (70.0, 100.0),
 }
 BAND_COLORS = {"Low": "#4575b4", "Normal": "#27936b", "High": "#d6812f"}
 MISSING_LABEL = "(Missing / unknown)"
